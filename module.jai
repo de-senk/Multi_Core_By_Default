@@ -1,13 +1,14 @@
-//NOTE: Second iteration.
-/*NOTE:
-    Next idea (absraction) 2 procedures 'GoWide()' and 'GoNarrow()':
+//NOTE: Third iteration.
+/*NOTE: IMPLEMENTED ON THIRD ITERATIONN
+        idea (absraction) 2 procedures 'GoWide()' and 'GoNarrow()':
         GoWide(): should set all the ranges and everything
         GoNarrow(): goes to single lane(I was thinking on GoSingle() but that would just be sad.)
         'work_slot' is the variable name one gets to get used to use.
+
 */
 
 
-//:jumptag_StuffThatImHappyWithAndIWillNotChange
+//:jumptag_StuffThatImHappyWithAndIWillNotChangeTooMuch
 
 #module_parameters(MAX_LANES := 200);
 #import "Basic"; //assert,max,min procedures
@@ -20,17 +21,18 @@ g_multicore_state: Multicore_By_Default_Global_State;
 
 #add_context worker_context: *Worker_Context;
 Worker_Context :: struct {
+    work_slot: s64; //this field is HOT (changes a LOT)
     lane_slot:   s64;
     lane_count: s64;
-    done: bool;
+    execute_widely: bool; //extremely useful
+    done: bool; // maybe delete.
 }
-
 
 Multicore_By_Default_Global_State :: struct {
     worker_contexts: [MAX_LANES]Worker_Context;
     threads: [MAX_LANES]Thread;
     total_lane_count: s64;
-    debug_initialized: s64;
+    debug_initialized: s64; // @Hack
 
     barrier_counter : s64; //for atomics
     barrier_sense   : s64; //for atomics
@@ -43,34 +45,13 @@ Multicore_By_Default_Global_State :: struct {
 
 }
 
-BroadcastSync :: (payload: *$T, src_lane: s64) {
-    using g_multicore_state;
-    using context.worker_context;
-    assert(payload != null, "you must pass a pointer to a pointer, you probably did, 'some_array_view.data' you should do '*some_array_view.data' instead");
-
-    is_src := lane_slot == src_lane;
-    is_destination := lane_slot != src_lane;
-
-    if is_src atomic_write(*broadcast_memory, cast(u64)(payload));
-    LaneSync();
-    if is_destination payload.* = (.*) cast(*T)atomic_read(*broadcast_memory);
-    LaneSync();
-}
-
-
-thread_join :: (thread: *Thread) -> s64 {
-    thread_data : *Worker_Context = thread.data;
-    while !thread_data.done  sleep_milliseconds(1);
-    thread_deinit(thread);
-    // release_thread(thread);
-    return thread_data.lane_slot;
-}
-
-
 deinitialize_multicore_by_default :: () {
     using g_multicore_state;
+
+    // @Hack: debug break if you call deinit more than once.
     debug_initialized -= 1;
     assert(debug_initialized == 0);
+
     for i: 0..total_lane_count-1 thread_join(*threads[i]);
     destroy(*wide_semaphore);
     destroy(*frame_semaphore);
@@ -85,7 +66,7 @@ initialize_multicore_by_default :: (procedure_to_execute_in_all_lanes: Thread_Pr
     init(*shared_mutex,"Block them All", 1);
     init(*wide_semaphore, 0);
     init(*frame_semaphore, 0);
-    
+
     num_cpus := get_number_of_processors();
     assert(num_cpus >= 1);
     if num_cpus > 200  num_cpus = 200;  // Clamp to a value that is reasonable as of 2021, in case we get weird data.
@@ -105,14 +86,20 @@ initialize_multicore_by_default :: (procedure_to_execute_in_all_lanes: Thread_Pr
 
 }
 
+thread_join :: (thread: *Thread) -> s64 {
+    thread_data : *Worker_Context = thread.data;
+    while !thread_data.done sleep_milliseconds(1);
+    thread_deinit(thread);
+    // release_thread(thread);
+    return thread_data.lane_slot;
+}
+
 InitializeCodecycle :: (thread_work: *Worker_Context)  #expand {
     // `defer thread_work.done = true;
     thread_work.done = true;
     `Codecycle_Called_InitializeCodecycle :: "make sure you are 'using your_thread_parameter_name; on the main scope";
     context.worker_context = thread_work;
 }
-
-
 
 //------------------
 //TODO: reame these procedures to something more nice looking.
@@ -144,40 +131,23 @@ GetLaneCount :: () -> s64 {
     return total_lane_count;
 }
 
-//NOTE: Terrible idea because YOU LOSE DEBUGGABILITY, when jai gets first class suport for #expand macros, then this might be a good idea.
-sync_lanes_for_range :: (total_items: s64, body: Code) #expand
-{
-    assert(false, "using this is stupid if you cannot debug it");
-    #if !#exists(`Codecycle_Called_InitializeCodecycle) #assert(false);
-
-
-    items_per_lane := (total_items +`lane_count - 1)/`lane_count;
-    `start_slot = `lane_slot * items_per_lane;
-    `end_slot = `start_slot + items_per_lane;
-    if `end_slot > total_items then `end_slot = total_items;
-    for i: `start_slot..`end_slot -1 {
-        `work_slot = i;
-        #insert body;
-    }
-
-    if `lane_count > 1 {
-        gen := atomic_read(*g_multicore_state.barrier_sense);
-        old_arrived := atomic_add(*g_multicore_state.barrier_counter, 1);
-        should_spin := true;
-        if old_arrived + 1 == `lane_count {
-            should_spin = false;
-            g_multicore_state.barrier_counter = 0;
-            atomic_add(*g_multicore_state.barrier_sense, 1);
-        }
-
-        if should_spin {
-            while atomic_read(*g_multicore_state.barrier_sense) == gen {
-                #asm { pause; } //TODO: make this crosspaltform (ARM, etc)
-            }
-        }
-    }
+GoWide :: (total_items: s64) #expand {
+    #if !#exists(`range) `range: Lane_Range;
+    assert(total_items > 0, "to execute only once you should send 1 as param");
+    using context.worker_context;
+    execute_widely = true;
+    LaneSync();
+    `range = LaneGetRange(total_items);
 }
 
+GoNarrow :: (total_items: s64)  #expand {
+    #if !#exists(`range) `range: Lane_Range;
+    using context.worker_context;
+    assert(total_items > 0, "to execute only once you should send 1 as param");
+    execute_widely=false;
+    LaneSync();
+    `range = LaneGetRange(total_items);
+}
 
 /*--- @Hack ----*/
 thread_yield :: () {
@@ -250,7 +220,22 @@ FixYourTimeStep_Loop :: (anti_spiral_treshold: float64 = 0.25) -> loop_max:s64, 
     return loop_max, delta_time, alpha;
 }
 
-//:jumptag_StuffThatImHappyWithAndIWillNotChange
+//:jumptag_StuffThatImHappyWithAndIWillNotChangeTooMuch
+
+
+BroadcastSync :: (payload: *$T, src_lane: s64) {
+    using g_multicore_state;
+    using context.worker_context;
+    assert(payload != null, "you must pass a pointer to a pointer, you probably did, 'some_array_view.data' you should do '*some_array_view.data' instead");
+
+    is_src := lane_slot == src_lane;
+    is_destination := lane_slot != src_lane;
+
+    if is_src atomic_write(*broadcast_memory, cast(u64)(payload));
+    LaneSync();
+    if is_destination payload.* = (.*) cast(*T)atomic_read(*broadcast_memory);
+    LaneSync();
+}
 
 Lane_Range :: struct {
     min: s64;
@@ -276,7 +261,17 @@ m_range_from_n_idx_m_count :: ( n_idx:s64,  n_count:s64,  m_count:s64) -> Lane_R
 
 LaneGetRange  :: (total_items: s64) -> Lane_Range  {
     using context.worker_context;
-    return m_range_from_n_idx_m_count(lane_slot, lane_count, total_items);
+    if execute_widely {
+        return m_range_from_n_idx_m_count(lane_slot, lane_count, total_items);
+    } else {
+    // inline debug_break();
+        result: Lane_Range;
+        result.min = 0;
+        result.max = total_items-1;
+        if lane_slot != 0 result.min = 0;
+        if lane_slot != 0 result.max = -1;
+        return result;
+    }
 }
 
 LaneSync :: ()  {
