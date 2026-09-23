@@ -1,17 +1,53 @@
-//NOTE: Third iteration.
-/*NOTE: IMPLEMENTED ON THIRD ITERATIONN
-        idea (absraction) 2 procedures 'GoWide()' and 'GoNarrow()':
-        GoWide(): should set all the ranges and everything
-        GoNarrow(): goes to single lane(I was thinking on GoSingle() but that would just be sad.)
-        'work_slot' is the variable name one gets to get used to use.
+#module_parameters(MAX_LANES := 200, USE_OS_BARRIER:=true);
+/*
+Design toughts: The main goal is 
+    to have debuggable multithreaded code 
+        - This is the main reason why using parallel_for or even using jai for_expansions are a bad idea.
+    to have very low friction for editing multithreaded code
+        - This is the reason why I opted for a state machine handling in the jai context
+        - if you want to run a line multithreaded you just move the line, almost every code modification is O(1) (1 line change to change behavior)
 
+GoWide sets the context state to execute the next ranged loop, widely.
+GoNarrow sets the context state to execute the next ranged loop, on a single thread.
+GoSingle is the same as GoNarrow, but it will only execute once. Its to avoid doing GoNarrow(1);
+
+Splitting of threads is experimental for now:
+    ...
+    backup_ctx, left_ctx, right_ctx := GetLaneSplitLeftRight();
+    SplitBegin(*left_ctx, *right_ctx);
+    LaneActivate(right_ctx); //SPLITTING towards RIGHT side threads
+    GoWide(arr_of_meshes.count);
+    for work_slot: range.min .. range.max { //for left lanes, range.max is -1
+       //this executes only on the right side threads
+    }
+    LaneActivate(left_ctx); //SPLITTING towards LEFT side threads
+    GoWide(arr_of_meshes.count); //Dont forget to call one of these first after activating, otherwise range.min and max will get bad values
+    for work_slot: range.min .. range.max { //for right lanes, range.max is -1
+       //this executes only on the Left side threads
+    }
+    LaneJoin(backup_ctx, left_ctx, right_ctx); //this executes LaneSync() internally.
+    ...
+    a bad thing is that you need to call reset_broadcasts_memory() once per frame to use this feature.
+    another bad thing is that this always splits in half, there is no way to tune it for now.
+
+There is many things that needs improve, per example barriers_memory, broadcasts_memory
+these are not aligned to 64 bytes, and it can get too MESI (intel joke)
 */
 
+#add_context worker_context: *Worker_Context;
+Worker_Context :: struct {
+    lane_slot:  s64;
+    lane_count: s64;
 
-//:jumptag_StuffThatImHappyWithAndIWillNotChangeTooMuch
+    //broadcast_slot: is called like that but is also used for barriers.
+    broadcast_slot:  s64; //also doubles as this lane-group's index into g_multicore_state.barrier_pool
 
-#module_parameters(MAX_LANES := 200, USE_OS_BARRIER:=true);
-#import "Basic"; //assert,max,min procedures
+    execute_widely: bool; //extremely useful
+    done: bool; // maybe delete.
+}
+
+
+#import "Basic"; //assert,max,min 
 #import "Thread";
 #import "Atomics";
 #import "System";
@@ -19,32 +55,35 @@
 
 g_multicore_state: Multicore_By_Default_Global_State;
 
-#add_context worker_context: *Worker_Context;
-Worker_Context :: struct {
-    work_slot: s64; //this field is HOT (changes a LOT)
-    zero_lane_global_slot:  s64;
-    lane_slot:  s64;
-    lane_count: s64;
-    execute_widely: bool; //extremely useful
-    subdivide_split: bool; //extremely useful
-    done: bool; // maybe delete.
-}
-
 Multicore_By_Default_Global_State :: struct {
     worker_contexts: [MAX_LANES]Worker_Context;
     threads: [MAX_LANES]Thread;
     total_lane_count: s64;
     debug_initialized: s64; // @Hack
 
-    barrier_counter : [MAX_LANES]Barrier; //for atomics
-    barrier_sense   : [MAX_LANES]Barrier; //for atomics
-    broadcast_memory: [MAX_LANES]u64; //for atomics
+    broadcasts_memory: [MAX_LANES*2]u64; //because wide pointers
+    barriers_memory: [MAX_LANES*2]Barrier;
+    broadcasts_memory_used_count: s64;
 
-    shared_mutex: Mutex; //using Mutex are slow, but useful for writting to a hash table inside a wide loop
+    barrier_pool: [MAX_LANES*2]Barrier;
 
+    shared_mutex: Mutex; //slow, but useful for writting to a hash table inside a wide loop or similar problems
+
+    //not happy about these but is the simplest solution I found for sokol_app and similar softwares that control your frame loop.
     frame_semaphore: Semaphore;
     wide_semaphore: Semaphore;
+}
 
+get_broadcast_slot :: () -> slot:s64 {
+    using g_multicore_state;
+    slot := atomic_add(*broadcasts_memory_used_count, 2);
+    assert(slot < broadcasts_memory.count, "broadcasts_memory exhausted");
+    return slot;
+}
+
+reset_broadcasts_memory :: () {
+    using g_multicore_state;
+    atomic_write(*broadcasts_memory_used_count, 2);
 }
 
 deinitialize_multicore_by_default :: () {
@@ -69,7 +108,6 @@ initialize_multicore_by_default :: (procedure_to_execute_in_all_lanes: Thread_Pr
     init(*wide_semaphore, 0);
     init(*frame_semaphore, 0);
 
-     // barrier_release(*barrier_sense[zero_lane_global_slot]);
 
 
     num_cpus := get_number_of_processors();
@@ -77,16 +115,25 @@ initialize_multicore_by_default :: (procedure_to_execute_in_all_lanes: Thread_Pr
     if num_cpus > 200  num_cpus = 200;  // Clamp to a value that is reasonable as of 2021, in case we get weird data.
     #if use_real_cores && (OS == .WINDOWS) || (OS == .LINUX) {
         num_cpus /= 2;// This routine reports hyperthreads, so, divide by two, because of Intel marketing.
-        num_cpus += 1; //TODO: Explanation why real cores + 1 hyperthread works
-    }
+        // num_cpus += 1; //TODO: Explanation why real cores + 1 hyperthread works
+    } 
+    //NOTE: you should use real cores otherwise when you profile you might wonder WHY your code is executing like it is singlethreaded when you have chrome running in the background.
 
     total_lane_count = min(cast(u32)num_cpus, MAX_LANES);
-    barrier_init(*barrier_sense[0], cast(s32)total_lane_count);
     for i: 0..total_lane_count-1 {
-        worker_contexts[i] = .{ lane_slot = cast(u32)i, lane_count = total_lane_count };
         thread_init(*threads[i], procedure_to_execute_in_all_lanes);
         assert(threads[i].index != 0);
+
+        //prepare worker context
+        worker_contexts[i] = .{ lane_slot = cast(u32)i, lane_count = total_lane_count };
         work_ptr := *worker_contexts[i];
+        if i == 0 {
+            barrier_init(*barriers_memory[0], cast(s32)total_lane_count);
+        }
+        // barriers_memory[broadcast_slot];
+        // work_ptr.barrier_target_ptr = *worker_contexts[0].barrier;
+
+        //start thread
         threads[i].data = work_ptr;
         thread_start(*threads[i]);
     }
@@ -102,15 +149,15 @@ thread_join :: (thread: *Thread) -> s64 {
     return thread_data.lane_slot;
 }
 
+//TODO: figure out a way to replace this garbage:
 InitializeCodecycle :: (thread_work: *Worker_Context)  #expand {
-    // `defer thread_work.done = true;
     thread_work.done = true;
-    `Codecycle_Called_InitializeCodecycle :: "make sure you are 'using your_thread_parameter_name; on the main scope";
+    `Codecycle_Called_InitializeCodecycle :: "make sure you are 'using your_thread_parameter_name; on the main scope"; //@Hack typechecking, not used, maybe delete.
     context.worker_context = thread_work;
 }
 
 //------------------
-//TODO: reame these procedures to something more nice looking.
+//TODO: reame these procedures to something more semantic content and more consistent case style.
 MDF_Semaphore_Wait_For_Frame :: () {
     using g_multicore_state;
     wait_for(*frame_semaphore);
@@ -125,6 +172,7 @@ MDF_Semaphore_Wait_For_Wide :: () {
     using g_multicore_state;
     assert(context.worker_context==null, "this procedure should be called in your frame loop");
     for 0..total_lane_count - 1 wait_for(*wide_semaphore);
+
 }
 MDF_Semaphore_Green_Frame :: () {
     using g_multicore_state;
@@ -139,77 +187,92 @@ GetLaneCount :: () -> s64 {
  return total_lane_count;
 }
 
-Lane_Context :: struct {
- zero_lane_global_slot: s64;
- lane_slot: s64;
- lane_count: s64;
-}
 
-GetLaneSplit :: () -> backup:Lane_Context, new_ctx: Lane_Context, I_am_right_side: bool, new_ane_count: int {
+// GetLaneSplit :: () -> backup:Lane_Context, new_ctx: Lane_Context, I_am_right_side: bool, new_ane_count: int {
+//  using context.worker_context;
+
+//  return backup, new_ctx, I_am_right_side, new_lane_count;
+// }
+SplitBegin :: SetLaneStackVariables;
+SetLaneStackVariables :: (left_ctx:*Worker_Context, right_ctx:*Worker_Context) {
  using context.worker_context;
- backup  : Lane_Context;
- new_ctx : Lane_Context;
- backup.lane_slot = lane_slot;
- backup.lane_count = lane_count;
- backup.zero_lane_global_slot = zero_lane_global_slot;
- new_ctx = backup;
+ LaneSync();
+ half := right_ctx.lane_count;
+ assert(right_ctx.lane_count == left_ctx.lane_count);
+ should_add_remaining := lane_count > 2 && lane_count % 2 != 0;
+ if should_add_remaining right_ctx.lane_count+=1;
 
- half := lane_count / 2;
- half = max(half, 1);
- new_ctx.lane_count = half;
+ //create new barriers using new corresponding lane_count's
+ left_broadcast_slot :int;
+ if lane_slot == 0 {
+     left_ctx.broadcast_slot = get_broadcast_slot();
+     right_ctx.broadcast_slot = get_broadcast_slot();
+     assert(left_ctx.broadcast_slot != 0);
+     assert(right_ctx.broadcast_slot != 0);
+     using g_multicore_state;
+     barrier_init(*barriers_memory[left_ctx.broadcast_slot], cast(s32)left_ctx.lane_count);
+     barrier_init(*barriers_memory[right_ctx.broadcast_slot], cast(s32)right_ctx.lane_count);
+ }
+ 
+ //broadcast the slot, the slot is called broadcast_slot but is also used for barriers.
+ LaneSync(); //this line is not needed I think
+ lane_sync_broadcast(*left_ctx.broadcast_slot, src_lane=0);
+ lane_sync_broadcast(*right_ctx.broadcast_slot, src_lane=0);
+
+ assert(left_ctx.broadcast_slot != 0);
+ assert(right_ctx.broadcast_slot != 0);
 
  I_am_right_side := lane_slot + 1 > half;
- if I_am_right_side
- {
-  //we remap the lane slot
-  new_ctx.lane_slot = lane_slot - half;
-  should_add_remaining := lane_count > 2 && lane_count % 2 != 0;
-  if should_add_remaining new_ctx.lane_count+=1;
- }
- new_lane_count := half;
- return backup, new_ctx, I_am_right_side, new_lane_count;
-}
 
-
-GetLaneSplitLeftRight :: () -> backup:Lane_Context, left:Lane_Context, right:Lane_Context {
- using context.worker_context;
- backup, new_ctx, I_am_right_side, new_lane_count := GetLaneSplit();
- left  := new_ctx;
- right := new_ctx;
-
+ //remap the lane slot
  if I_am_right_side {
-  left.lane_count = 0; //we disable left lane
-  // left.zero_lane_global_slot = new_ctx.zero_lane_global_slot; //this line mght be pointless
-  // We set new zero slot:
-  right.zero_lane_global_slot += new_lane_count;
+  right_ctx.lane_slot = lane_slot - half;
+ }
+
+ //disables left or right codepaths (crossed)
+ if I_am_right_side {
+  left_ctx.lane_count = 0; //we disable left lane for all right threads
  } else {
-  right.lane_count = 0; //we disable right
-  left.zero_lane_global_slot += new_lane_count;
+  right_ctx.lane_count = 0; //we disable right lane for all left threads
  }
-
- return backup, left, right;
+ LaneSync(); //idk if this is needed
 }
 
-LaneJoin :: (ctx: Lane_Context) {
+GetLaneSplitLeftRight :: () -> backup:Worker_Context, left:Worker_Context, right:Worker_Context {
  using context.worker_context;
- using g_multicore_state;
- LaneActivate(ctx);
+ backup   :Worker_Context=  context.worker_context.*;
+ left_ctx :Worker_Context=  context.worker_context.*;
+ right_ctx:Worker_Context=  context.worker_context.*;
+
+ //setup left right (same for all threads)
+ half := lane_count / 2;
+ half = max(half, 1);
+ left_ctx.lane_count  = half;
+ right_ctx.lane_count = half; 
+ left_ctx.broadcast_slot = -1;
+ right_ctx.broadcast_slot = -1;
+
+ return backup, left_ctx, right_ctx;
 }
 
-LaneActivate :: (ctx: Lane_Context) {
- using context.worker_context;
-  using g_multicore_state;
- if ctx.lane_count == 0 return; //I hate protective coding
+LaneJoin :: (backup: Worker_Context, left_ctx:Worker_Context, right_ctx:Worker_Context) {
+ LaneSync(); //Idk if I should lanesync here.
+ LaneActivate(backup);
+ assert(context.worker_context.broadcast_slot == 0);
 
- //replace worker context state
- lane_slot = ctx.lane_slot;
- lane_count = ctx.lane_count;
- zero_lane_global_slot = ctx.zero_lane_global_slot;
+ //delete splitted barriers, (maybe I should GoSingle() this.)
+ if context.worker_context.lane_slot == 0 {
+    using g_multicore_state;
 
- if lane_slot == 0 {
-    barrier_release(*barrier_sense[zero_lane_global_slot]);
-    barrier_init(*barrier_sense[zero_lane_global_slot], cast(s32)lane_count);
+    barrier_release(*barriers_memory[left_ctx.broadcast_slot]);
+    barrier_release(*barriers_memory[right_ctx.broadcast_slot]);
  }
+
+ LaneSync(); //idk if I should lanesync here
+}
+
+LaneActivate :: (ctx: Worker_Context) {
+ context.worker_context.* = ctx;
 }
 
 GoWide :: (total_items: s64) #expand {
@@ -243,78 +306,22 @@ thread_yield :: () {
     }
 }
 
-
-//
-//from Glenn Fiedler: gafferongames.com/post/fix_your_timestep/
-//
-g_renderer_time_apollo: Apollo_Time;
-
-//call this from renderer codecycle
-RendererTime_Produce :: () {
-    atomic_write(*g_renderer_time_apollo, current_time_consensus());
-}
-
-//consume in any other codecycle
-RendererTime_Consume :: () -> float64 {
-    apollo_time := atomic_read(*g_renderer_time_apollo);
-    return to_float64_seconds(apollo_time);
-
-}
-
-Codecycle :: struct {
-    hertz:        float64;
-    total_time:        float64;
-    delta_time:        float64;
-    current_time:      float64;
-    accumulator: float64;
-}
-
-FixYourTimeStep_InitForThread :: (_hertz: float64) #expand {
-    `codecycle_ctx: Codecycle;
-    using `codecycle_ctx;
-    current_time = RendererTime_Consume();
-    accumulator  = 0.0;
-    total_time   = 0.0;
-    hertz        = _hertz;
-    delta_time   = 1.0/_hertz; //?: hardcoded for some reason
-}
-
-
-
-FixYourTimeStep_Loop :: (anti_spiral_treshold: float64 = 0.25) -> loop_max:s64, dt:float64, alpha:float64 #expand {
-    using `codecycle_ctx;
-    new_time := RendererTime_Consume();
-    frame_time := new_time - current_time;
-    if ( frame_time > anti_spiral_treshold )
-            frame_time = anti_spiral_treshold;
-    current_time = new_time;
-    accumulator += frame_time;
-
-    loop_max: s64 = -1 ; //because jai foor loops need negative numbers to NOT process
-
-    while accumulator >= delta_time {
-        loop_max+=1;
-        accumulator -= frame_time;
-        total_time += delta_time;
-    }
-
-    alpha := accumulator / delta_time;
-    return loop_max, delta_time, alpha;
-}
-
-//:jumptag_StuffThatImHappyWithAndIWillNotChangeTooMuch
-
+BroadcastSync :: lane_sync_broadcast;
+#if 0 //DISABLED FOR NOW; use lane_sync_broadcast for now
 BroadcastSync :: (payload: *$T, src_lane: s64) {
     using g_multicore_state;
     using context.worker_context;
+    #assert(size_of(T) <= 8 && "Cannot broadcast values larger than 8 bytes");
+
+    // assert(context.worker_context.barrier_target_ptr != null);
     assert(payload != null, "you must pass a pointer to a pointer, you probably did, 'some_array_view.data' you should do '*some_array_view.data' instead");
 
     is_src := lane_slot == src_lane;
     is_destination := lane_slot != src_lane;
 
-    if is_src atomic_write(*broadcast_memory[zero_lane_global_slot], cast(u64)(payload));
+    if is_src atomic_write(*broadcasts_memory[broadcast_slot], cast(u64)(payload));
     LaneSync();
-    if is_destination payload.* = (.*) cast(*T)atomic_read(*broadcast_memory[zero_lane_global_slot]);
+    if is_destination payload.* = (.*) cast(*T)atomic_read(*broadcasts_memory[broadcast_slot]);
     LaneSync();
 }
 
@@ -323,7 +330,7 @@ Lane_Range :: struct {
     max: s64;
 }
 
-//src is Ryan Fleury, raddbg codebase, standard MIT licenced, licence at end of file:
+//m_range_from_n_idx_m_count is an almost direct copy, src is Ryan Fleury, raddbg codebase, standard MIT licenced, licence at end of file. :tagMITLicense
 m_range_from_n_idx_m_count :: ( n_idx:s64,  n_count:s64,  m_count:s64) -> Lane_Range
 {
  main_idxes_per_lane:s64 = m_count/n_count;
@@ -353,6 +360,146 @@ LaneGetRange  :: (total_items: s64) -> Lane_Range {
 
  return result;
 }
+
+LaneSync :: (caller_loc := #caller_location) #expand {
+    //typechecking
+    #if #exists(`work_slot) #run assert(false, "\n\n%1:%2,%3: Error: You must NEVER call LaneSync() inside a for work_slot: range.min..range.max",caller_loc.fully_pathed_filename, caller_loc.line_number, caller_loc.character_number,);;
+    #if #exists(`it) #run assert(false, "\n\n%1,%2 Error: You must NEVER call LaneSync() inside a for range.min..range.max",caller_loc.fully_pathed_filename, caller_loc.line_number, caller_loc.character_number,);;
+
+    //hacks
+    if context.worker_context.lane_count == 0 return; //search_tag_ImNotHappyAboutThisLine
+    if context.worker_context.lane_count == 1 return; //search_tag_ImNotHappyAboutThisLine
+
+    lane_sync_broadcast(ptr = null, src_lane = 0, caller_loc = caller_loc);
+}
+
+//TODO: delete caller_loc or make use of it. and maybe stylize it to my way of coding (i.e.: the procedure LaneGetRange or the disabled BroadcastSync)
+lane_sync_broadcast :: (ptr: *$T, src_lane: s32, caller_loc := #caller_location) #expand #no_debug {
+ using context.worker_context;
+ using g_multicore_state;
+ #assert(size_of(T) <= 8 && "Cannot broadcast values larger than 8 bytes");
+
+ if ptr != null && lane_slot == src_lane {
+     memcpy(*broadcasts_memory[broadcast_slot], ptr, size_of(T));
+ }
+
+ barrier_wait(*barriers_memory[broadcast_slot]);
+
+ if ptr != null && lane_slot != src_lane {
+     memcpy(ptr, *broadcasts_memory[broadcast_slot], size_of(T));
+ }
+
+ if ptr {
+     barrier_wait(*barriers_memory[broadcast_slot]);
+ }
+}
+
+
+
+/*
+TODO: 
+    codecycles, tickings of multiple codecycles
+    (maye ask Ryan directly because it seems like I cannot figure this out)
+*/
+//
+//from Glenn Fiedler: gafferongames.com/post/fix_your_timestep/
+//
+g_renderer_time_apollo: Apollo_Time;
+
+//call this from renderer codecycle
+RendererTime_Produce :: () {
+    ctime := current_time_consensus();
+    atomic_write(*g_renderer_time_apollo.low, ctime.low);
+    atomic_write(*g_renderer_time_apollo.high, ctime.high);
+}
+
+//consume in any other codecycle
+RendererTime_Consume :: () -> float64 {
+    apollo_time := atomic_read(*g_renderer_time_apollo);
+    return to_float64_seconds(apollo_time);
+
+}
+
+Codecycle :: struct {
+    hertz:        float64;
+    total_time:   float64;
+    delta_time:   float64;
+    current_time: float64;
+    accumulator:  float64;
+}
+
+FixYourTimeStep_InitForThread :: (_hertz: float64) #expand {
+    `codecycle_ctx: Codecycle;
+    using `codecycle_ctx;
+    current_time = RendererTime_Consume();
+    accumulator  = 0.0;
+    total_time   = 0.0;
+    hertz        = _hertz;
+    delta_time   = 1.0/_hertz; //?: hardcoded for some reason
+}
+ 
+FixYourTimeStep_Loop :: (anti_spiral_treshold: float64 = 0.25) -> loop_max:s64, dt:float64, alpha:float64 #expand {
+    using `codecycle_ctx;
+    new_time := RendererTime_Consume();
+    frame_time := new_time - current_time;
+    if ( frame_time > anti_spiral_treshold )
+            frame_time = anti_spiral_treshold;
+    current_time = new_time;
+    accumulator += frame_time;
+
+    loop_max: s64 = -1 ; //because jai foor loops need negative numbers to NOT process
+
+    while accumulator >= delta_time {
+        loop_max+=1;
+        accumulator -= frame_time;
+        total_time += delta_time;
+    }
+
+    alpha := accumulator / delta_time;
+    return loop_max, delta_time, alpha;
+}
+
+// BroadcastSyncOLD :: (payload: *$T, src_lane: s64) {
+//     using g_multicore_state;
+//     using context.worker_context;
+//     assert(payload != null, "you must pass a pointer to a pointer, you probably did, 'some_array_view.data' you should do '*some_array_view.data' instead");
+
+//     is_src := lane_slot == src_lane;
+//     is_destination := lane_slot != src_lane;
+
+//     if is_src atomic_write(*broadcasts_memory[zero_lane_global_slot], cast(u64)(payload));
+//     LaneSync();
+//     if is_destination payload.* = (.*) cast(*T)atomic_read(*broadcasts_memory[zero_lane_global_slot]);
+//     LaneSync();
+// }
+
+// LaneSyncBACKUP :: ()  {
+//  using context.worker_context;
+//  using g_multicore_state;
+//  if lane_count > 1 {
+//   local_sense := 1 - atomic_read(*barrier_sense[zero_lane_global_slot]);
+//   old_arrived := atomic_add(*barrier_counter[zero_lane_global_slot], 1);
+
+//   last_thread_arrived := old_arrived + 1 == lane_count;
+//   should_spin := !last_thread_arrived;
+
+//   if should_spin {
+//    while atomic_read(*barrier_sense[zero_lane_global_slot]) != local_sense {
+//     #asm { pause; }
+//    }
+//   }
+
+//   if last_thread_arrived {
+//    atomic_write(*barrier_counter[zero_lane_global_slot], 0);
+//    atomic_write(*barrier_sense[zero_lane_global_slot], local_sense);
+//   }
+
+//  }
+// }
+/*
+TODO: figure out if this is worth the effort. I personally think that read write and full barriers introduce a lot of code complexitty
+and doing mfence is the way to go for this module.
+
 
 CompilerFence :: () {
 #run log("TODO: CompilerFence :: () {, llvm probably changes order of stuff");
@@ -387,56 +534,7 @@ BarrierFlushAll :: () {
 //ARM -> DMB (Data Memory Barrier)
 
 }
-
-LaneSync :: (caller_loc := #caller_location) #expand {
-    lane_sync_broadcast(ptr = null, src_lane_index = 0, caller_loc = caller_loc);
-}
-
-// LaneSyncBACKUP :: ()  {
-//  using context.worker_context;
-//  using g_multicore_state;
-//  if lane_count > 1 {
-//   local_sense := 1 - atomic_read(*barrier_sense[zero_lane_global_slot]);
-//   old_arrived := atomic_add(*barrier_counter[zero_lane_global_slot], 1);
-
-//   last_thread_arrived := old_arrived + 1 == lane_count;
-//   should_spin := !last_thread_arrived;
-
-//   if should_spin {
-//    while atomic_read(*barrier_sense[zero_lane_global_slot]) != local_sense {
-//     #asm { pause; }
-//    }
-//   }
-
-//   if last_thread_arrived {
-//    atomic_write(*barrier_counter[zero_lane_global_slot], 0);
-//    atomic_write(*barrier_sense[zero_lane_global_slot], local_sense);
-//   }
-
-//  }
-// }
-
-lane_sync_broadcast :: (ptr: *$T, src_lane_index: s32, caller_loc := #caller_location) #expand #no_debug {
- using context.worker_context;
- using g_multicore_state;
- #assert(size_of(T) <= 8 && "Cannot broadcast values larger than 8 bytes");
-
- if ptr != null && lane_slot == src_lane_index {
-     memcpy(*broadcast_memory[zero_lane_global_slot], ptr, size_of(T));
- }
-
- barrier_wait(*barrier_sense[zero_lane_global_slot]);
-
- if ptr != null && lane_slot != src_lane_index {
-     memcpy(ptr, *broadcast_memory[zero_lane_global_slot], size_of(T));
- }
-
- if ptr {
-     barrier_wait(*barrier_sense[zero_lane_global_slot]);
- }
-}
-
-
+*/
 
 //NOTE: Windows have OS barrers which are really good (I guess), mac, and probably other OS's doesnt have them.
 
@@ -593,7 +691,7 @@ BARRIER_SPIN_COUNT :: 8 * 1024;
 
 MIT License
 
-Copyright (c) 2026 Roey Borsteinas
+Copyright (c) 2026 Roey Borsteinas, Ryan Fleury and Epic Games Tools
 
 Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
 

@@ -3,7 +3,7 @@
 // problem 1, WideEntryPoint need to call InitializeCodecycle
 // problem 2, semaphores wrangling is annoying, but idk what to do.
 // problem 3, thread_yield() is stupid, but maybe there is no escape from it.
-#import,dir "../Multi_Core_By_Default";
+#import,dir "../../Multi_Core_By_Default";
 #import "Thread";
 #import "Basic";
 
@@ -26,10 +26,10 @@ sokol_init_frame_cb :: () {
 }
 
 sokol_request_quit :: () {
-    g_sokol_weird_counter+=1;
-
-    //because sokol can run more than 1 frame_cb when you request a quit.
-    if g_sokol_weird_counter > 3 g_sokol_is_running = false;
+    //this is a simulation of sokol_app internals
+        //because sokol can run more than 1 frame_cb when you request a quit.
+        if g_sokol_weird_counter > 3 g_sokol_is_running = false;
+        g_sokol_weird_counter+=1;
 }
 
 sokol_cleanup_cb :: () {
@@ -38,10 +38,11 @@ sokol_cleanup_cb :: () {
 
 sokol_frame_cb :: () {
 
+    //this block is ugly, to reduce ugliness you need to do it like sokol_frame_cb_OLD
     if should_exit_software {
         lane_cont := GetLaneCount();
         if lane_cont > 0 {
-            for 0..lane_cont-1 MDF_Semaphore_Green_Wide();
+            for 0..lane_cont-1 MDF_Semaphore_Green_Wide(); 
             deinitialize_multicore_by_default();
         }
         sokol_request_quit();
@@ -71,6 +72,9 @@ WideEntryPoint:: (thread: *Thread) -> s64 {
     InitializeCodecycle(thread_work);
     assert(g_multicore_is_initialized);
     assert(context.worker_context != null);
+
+    //LoadAssets();
+
     counter:int;
     while !atomic_read(*should_exit_software) {
         LaneSync();
@@ -109,4 +113,30 @@ WideEntryPoint:: (thread: *Thread) -> s64 {
     MDF_Semaphore_Green_Wide();
 
     return 0;
+}
+
+
+
+sokol_frame_cb_OLD :: () {
+    if should_exit_software return; //we will get stuck here, I decided to stop thinking about this and not fix it.
+   
+    if !g_multicore_is_initialized {
+        g_multicore_is_initialized = true;
+        initialize_multicore_by_default(WideEntryPoint);
+    }
+
+    //I need to rename these
+    MDF_Semaphore_Green_Frame();
+    MDF_Semaphore_Wait_For_Wide();
+
+     if should_exit_software {
+        deinitialize_multicore_by_default();
+        sokol_request_quit();
+        return;
+    }
+
+    //here you call your stuff that only can becalled inside frame_cb()
+    // sg_end_pass();
+    // sg_commit();
+
 }

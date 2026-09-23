@@ -1,5 +1,6 @@
 *.rdb
 *.rdi
+.build
 
 # Prerequisites
 *.d
