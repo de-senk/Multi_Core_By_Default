@@ -1,7 +1,7 @@
 #module_parameters(MAX_LANES := 200, USE_OS_BARRIER:=true);
 /*
-Design toughts: The main goal is 
-    to have debuggable multithreaded code 
+Design toughts: The main goal is
+    to have debuggable multithreaded code
         - This is the main reason why using parallel_for or even using jai for_expansions are a bad idea.
     to have very low friction for editing multithreaded code
         - This is the reason why I opted for a state machine handling in the jai context
@@ -38,6 +38,7 @@ these are not aligned to 64 bytes, and it can get too MESI (intel joke)
 Worker_Context :: struct {
     lane_slot:  s64;
     lane_count: s64;
+    range: Lane_Range;
 
     //broadcast_slot: is called like that but is also used for barriers.
     broadcast_slot:  s64; //also doubles as this lane-group's index into g_multicore_state.barrier_pool
@@ -47,7 +48,7 @@ Worker_Context :: struct {
 }
 
 
-#import "Basic"; //assert,max,min 
+#import "Basic"; //assert,max,min
 #import "Thread";
 #import "Atomics";
 #import "System";
@@ -116,7 +117,7 @@ initialize_multicore_by_default :: (procedure_to_execute_in_all_lanes: Thread_Pr
     #if use_real_cores && (OS == .WINDOWS) || (OS == .LINUX) {
         num_cpus /= 2;// This routine reports hyperthreads, so, divide by two, because of Intel marketing.
         // num_cpus += 1; //TODO: Explanation why real cores + 1 hyperthread works
-    } 
+    }
     //NOTE: you should use real cores otherwise when you profile you might wonder WHY your code is executing like it is singlethreaded when you have chrome running in the background.
 
     total_lane_count = min(cast(u32)num_cpus, MAX_LANES);
@@ -213,7 +214,7 @@ SetLaneStackVariables :: (left_ctx:*Worker_Context, right_ctx:*Worker_Context) {
      barrier_init(*barriers_memory[left_ctx.broadcast_slot], cast(s32)left_ctx.lane_count);
      barrier_init(*barriers_memory[right_ctx.broadcast_slot], cast(s32)right_ctx.lane_count);
  }
- 
+
  //broadcast the slot, the slot is called broadcast_slot but is also used for barriers.
  LaneSync(); //this line is not needed I think
  lane_sync_broadcast(*left_ctx.broadcast_slot, src_lane=0);
@@ -248,7 +249,7 @@ GetLaneSplitLeftRight :: () -> backup:Worker_Context, left:Worker_Context, right
  half := lane_count / 2;
  half = max(half, 1);
  left_ctx.lane_count  = half;
- right_ctx.lane_count = half; 
+ right_ctx.lane_count = half;
  left_ctx.broadcast_slot = -1;
  right_ctx.broadcast_slot = -1;
 
@@ -275,23 +276,21 @@ LaneActivate :: (ctx: Worker_Context) {
  context.worker_context.* = ctx;
 }
 
-GoWide :: (total_items: s64) #expand {
-    #if !#exists(`range) `range: Lane_Range;
+GoWide :: (total_items: s64) {
     assert(total_items > 0, "to execute only once you should send 1 as param");
     using context.worker_context;
     execute_widely = true;
     LaneSync();
-    `range = LaneGetRange(total_items);
+    range = LaneGetRange(total_items);
 }
 
 GoSingle :: #bake_arguments GoNarrow(total_items=1);
-GoNarrow :: (total_items: s64)  #expand {
-    #if !#exists(`range) `range: Lane_Range;
+GoNarrow :: (total_items: s64) {
     using context.worker_context;
     assert(total_items > 0, "to execute only once you should send 1 as param");
     execute_widely=false;
     LaneSync();
-    `range = LaneGetRange(total_items);
+    range = LaneGetRange(total_items);
 }
 
 /*--- @Hack ----*/
@@ -397,7 +396,7 @@ lane_sync_broadcast :: (ptr: *$T, src_lane: s32, caller_loc := #caller_location)
 
 
 /*
-TODO: 
+TODO:
     codecycles, tickings of multiple codecycles
     (maye ask Ryan directly because it seems like I cannot figure this out)
 */
@@ -437,7 +436,7 @@ FixYourTimeStep_InitForThread :: (_hertz: float64) #expand {
     hertz        = _hertz;
     delta_time   = 1.0/_hertz; //?: hardcoded for some reason
 }
- 
+
 FixYourTimeStep_Loop :: (anti_spiral_treshold: float64 = 0.25) -> loop_max:s64, dt:float64, alpha:float64 #expand {
     using `codecycle_ctx;
     new_time := RendererTime_Consume();
@@ -551,9 +550,9 @@ BARRIER_SPIN_COUNT :: 8 * 1024;
         initialized: bool; //to avoids for leaks in LaneSplit strategy
     }
 
-    barrier_init :: (using barrier: *Barrier, count: s32) {
+    barrier_init :: (using barrier: *Barrier, _count: s32) {
         assert(initialized == false);
-        num_threads   = count;
+        num_threads   = _count;
         count         = 0;
         generation_id = 0;
         init(*mutex);
